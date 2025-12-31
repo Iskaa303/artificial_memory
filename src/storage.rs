@@ -14,19 +14,8 @@ impl FileStorage {
         Self::default()
     }
 
-    pub async fn add(&mut self, source: impl Into<AddingSource>) -> &mut Self {
-        match source.into() {
-            AddingSource::Single(path) => {
-                let path_buf = PathBuf::from(path);
-                self.add_recursive(path_buf).await;
-            }
-            AddingSource::Many(paths) => {
-                for path in paths {
-                    let path_buf = PathBuf::from(path);
-                    self.add_recursive(path_buf).await;
-                }
-            }
-        }
+    pub async fn add(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.add_recursive(path.into()).await;
         self
     }
 
@@ -47,15 +36,12 @@ impl FileStorage {
                 }
             }
         } else {
-            match tfs::canonicalize(&path).await {
-                Ok(canonical) => {
-                    debug!("Adding file: {}", canonical.display());
-                    self.paths.insert(canonical);
-                }
-                Err(_) => {
-                    self.paths.insert(path);
-                }
-            }
+            let target_path = match tfs::canonicalize(&path).await {
+                Ok(canonical) => canonical,
+                Err(_) => path,
+            };
+            debug!("Adding file: {}", target_path.display());
+            self.paths.insert(target_path);
         }
     }
 
@@ -65,34 +51,5 @@ impl FileStorage {
 
     pub fn paths(&self) -> &BTreeSet<PathBuf> {
         &self.paths
-    }
-}
-
-pub enum AddingSource {
-    Single(String),
-    Many(Vec<String>),
-}
-
-impl From<&str> for AddingSource {
-    fn from(s: &str) -> Self {
-        Self::Single(s.to_string())
-    }
-}
-
-impl From<String> for AddingSource {
-    fn from(s: String) -> Self {
-        Self::Single(s)
-    }
-}
-
-impl From<Vec<String>> for AddingSource {
-    fn from(v: Vec<String>) -> Self {
-        Self::Many(v)
-    }
-}
-
-impl From<Vec<&str>> for AddingSource {
-    fn from(v: Vec<&str>) -> Self {
-        Self::Many(v.into_iter().map(|s| s.to_string()).collect())
     }
 }

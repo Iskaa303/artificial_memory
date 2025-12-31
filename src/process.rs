@@ -1,7 +1,6 @@
 use eyre::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, error, info, trace, warn};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{TextDiff, udiff::UnifiedDiff};
@@ -17,11 +16,11 @@ const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB
 #[derive(Error, Debug)]
 pub enum ProcessError {
     #[error("failed to create directory: {0}")]
-    CreateDirError(PathBuf),
+    CreateDir(PathBuf),
     #[error("failed to handle file: {0}")]
-    FileError(PathBuf),
+    File(PathBuf),
     #[error("failed to write metadata: {0}")]
-    MetadataError(PathBuf),
+    Metadata(PathBuf),
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -57,7 +56,7 @@ impl Processor {
         );
 
         let mut handles = Vec::new();
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(512)); // Global concurrency limit
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16)); // Limit concurrent I/O to 16
         let multi = std::sync::Arc::new(MultiProgress::new());
 
         for path in paths_vec {
@@ -89,12 +88,12 @@ impl Processor {
         let path_ref = &path;
         let metadata = tokio::fs::metadata(path_ref).await.map_err(|e| {
             error!("Failed to get metadata for {}: {}", path_ref.display(), e);
-            ProcessError::FileError(path_ref.to_path_buf())
+            ProcessError::File(path_ref.to_path_buf())
         })?;
         let current_size = metadata.len();
         let current_mtime = metadata
             .modified()
-            .map_err(|_| ProcessError::FileError(path.to_path_buf()))?
+            .map_err(|_| ProcessError::File(path.to_path_buf()))?
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
@@ -113,7 +112,7 @@ impl Processor {
                     target_dir.display(),
                     e
                 );
-                ProcessError::CreateDirError(target_dir.clone())
+                ProcessError::CreateDir(target_dir.clone())
             })?;
         }
 
@@ -127,7 +126,7 @@ impl Processor {
                         history_path.display(),
                         e
                     );
-                    ProcessError::MetadataError(history_path.clone())
+                    ProcessError::Metadata(history_path.clone())
                 })?;
             serde_json::from_str(&data).unwrap_or_else(|_| {
                 warn!(
@@ -148,22 +147,29 @@ impl Processor {
             }
         };
 
-        if let Some(latest) = history.versions.last() {
-            if latest.size == current_size && latest.mtime_ns == current_mtime {
-                trace!("[{}] Skipping unchanged file (metadata).", file_basename);
-                return Ok(());
-            }
+        if history
+            .versions
+            .last()
+            .is_some_and(|l| l.size == current_size && l.mtime_ns == current_mtime)
+        {
+            trace!("[{}] Skipping unchanged file (metadata).", file_basename);
+            return Ok(());
         }
 
-        let current_hash = Self::process_chunks_parallel(&path, semaphore, multi).await?;
+        let _permit = semaphore
+            .acquire()
+            .await
+            .wrap_err("Failed to acquire semaphore")?;
+        let current_hash = Self::process_file_stream(&path, multi).await?;
 
         // Deep change detection
-        if let Some(latest) = history.versions.last() {
-            if latest.hash == current_hash {
-                trace!("[{}] Skipping unchanged file (content).", file_basename);
-                // Update metadata if hash matched but mtime didn't
-                return Ok(());
-            }
+        if history
+            .versions
+            .last()
+            .is_some_and(|l| l.hash == current_hash)
+        {
+            trace!("[{}] Skipping unchanged file (content).", file_basename);
+            return Ok(());
         }
 
         // Diff and Storage Stage
@@ -185,7 +191,7 @@ impl Processor {
                     if !diff_text.is_empty() {
                         tokio::fs::write(&diff_path, diff_text).await.map_err(|e| {
                             error!("Failed to write diff file {}: {}", diff_path.display(), e);
-                            ProcessError::FileError(diff_path)
+                            ProcessError::File(diff_path)
                         })?;
                         diff_filename = Some(diff_name);
                     }
@@ -212,7 +218,7 @@ impl Processor {
                 temp_latest.display(),
                 e
             );
-            ProcessError::FileError(temp_latest.clone())
+            ProcessError::File(temp_latest.clone())
         })?;
         tokio::fs::rename(&temp_latest, &latest_file_path)
             .await
@@ -223,7 +229,7 @@ impl Processor {
                     latest_file_path.display(),
                     e
                 );
-                ProcessError::FileError(latest_file_path)
+                ProcessError::File(latest_file_path)
             })?;
 
         let next_version = history.versions.len() as u32 + 1;
@@ -246,122 +252,91 @@ impl Processor {
                     history_path.display(),
                     e
                 );
-                ProcessError::MetadataError(history_path)
+                ProcessError::Metadata(history_path)
             })?;
 
         info!("[{}] Version v{} stored.", file_basename, next_version);
         Ok(())
     }
 
-    async fn process_chunks_parallel(
+    async fn process_file_stream(
         path: &Path,
-        _semaphore: std::sync::Arc<tokio::sync::Semaphore>, // Kept for signature, but Rayon handles parallel CPU
         multi: std::sync::Arc<MultiProgress>,
     ) -> Result<String> {
-        let file_size = fs::metadata(path)
-            .map_err(|_| ProcessError::FileError(path.to_path_buf()))?
-            .len();
-        let num_chunks = ((file_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
+        let metadata = fs::metadata(path).map_err(|_| ProcessError::File(path.to_path_buf()))?;
+        let file_size = metadata.len();
+
         let file_basename = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let pb = multi.add(ProgressBar::new(num_chunks as u64));
+        let pb = multi.add(ProgressBar::new(file_size));
         pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")?
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}")?
             .progress_chars("#>-"));
         pb.set_message(file_basename.clone());
 
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<Result<(usize, Vec<u8>), std::io::Error>>(128); // Deeper buffer
-        let file_path = path.to_path_buf();
-
-        // I/O Producer Thread: Fast sequential reads
-        std::thread::spawn(move || {
-            let mut f = match fs::File::open(&file_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.send(Err(e)); // Send the error to the consumer
-                    return;
-                }
-            };
-
-            for i in 0..num_chunks {
-                let offset = i as u64 * CHUNK_SIZE as u64;
-                let current_chunk_size =
-                    std::cmp::min(CHUNK_SIZE as u64, file_size - offset) as usize;
-
-                let mut buffer = vec![0u8; current_chunk_size];
-                use std::io::Seek;
-                if let Err(e) = f.seek(std::io::SeekFrom::Start(offset)) {
-                    let _ = tx.send(Err(e));
-                    break;
-                }
-                if let Err(e) = f.read_exact(&mut buffer) {
-                    let _ = tx.send(Err(e));
-                    break;
-                }
-                if tx.send(Ok((i, buffer))).is_err() {
-                    // Receiver disconnected, likely due to an error or early termination
-                    break;
-                }
-            }
-        });
-
+        let path_buf = path.to_path_buf();
         let pb_inner = pb.clone();
-        let results = tokio::task::spawn_blocking(move || {
-            rx.into_iter()
-                .par_bridge()
-                .map(|item| {
-                    let (idx, data) = item?;
-                    let hash = Self::calculate_data_hash(&data);
-                    pb_inner.inc(1);
-                    Ok::<(usize, String), std::io::Error>((idx, hash))
-                })
-                .collect::<Result<Vec<(usize, String)>, std::io::Error>>()
+        let hash = tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut f =
+                fs::File::open(&path_buf).map_err(|_| ProcessError::File(path_buf.clone()))?;
+
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0u8; CHUNK_SIZE];
+
+            loop {
+                let n = f
+                    .read(&mut buffer)
+                    .map_err(|_| ProcessError::File(path_buf.clone()))?;
+                if n == 0 {
+                    break;
+                }
+
+                let chunk = &buffer[..n];
+                // Efficient \r filtering: find segments between \r and update hasher with slices
+                let mut start = 0;
+                while let Some(pos) = chunk[start..].iter().position(|&b| b == b'\r') {
+                    let actual_pos = start + pos;
+                    hasher.update(&chunk[start..actual_pos]);
+                    start = actual_pos + 1;
+                }
+                hasher.update(&chunk[start..]);
+
+                pb_inner.inc(n as u64);
+            }
+
+            Ok(format!("{:x}", hasher.finalize()))
         })
         .await
-        .wrap_err("Parallel hashing task panicked")??;
-
-        if results.len() != num_chunks {
-            error!(
-                "[{}] Chunk count mismatch: expected {}, got {}",
-                file_basename,
-                num_chunks,
-                results.len()
-            );
-            return Err(eyre::eyre!("Chunk count mismatch for {}", file_basename));
-        }
+        .wrap_err("Hashing task panicked")??;
 
         pb.finish_with_message(format!("{} [DONE]", file_basename));
-
-        info!("[{}] Hashing complete. Ordering results...", file_basename);
-
-        let mut sorted_results = results;
-        sorted_results.sort_by_key(|(idx, _)| *idx);
-        let mut file_hasher = Sha256::new();
-        for (_, hash) in sorted_results {
-            file_hasher.update(hash.as_bytes());
-        }
-
-        Ok(format!("{:x}", file_hasher.finalize()))
-    }
-
-    fn calculate_data_hash(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        format!("{:x}", hasher.finalize())
+        Ok(hash)
     }
 
     fn calculate_path_alias(path: &Path) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(path.to_string_lossy().as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!("{}_{}", &hash[..12], filename)
+        let path_str = path.to_string_lossy().replace("\\", "/");
+        let path_clean = path_str.trim_start_matches("//?/");
+
+        let normalized = if let Ok(cwd) = std::env::current_dir() {
+            let cwd_str = cwd.to_string_lossy().replace("\\", "/");
+            let cwd_clean = cwd_str.trim_start_matches("//?/");
+
+            if let Some(rel) = path_clean.strip_prefix(cwd_clean) {
+                rel.trim_start_matches('/')
+            } else {
+                path_clean
+            }
+        } else {
+            path_clean
+        };
+
+        normalized
+            .replace(":", "_")
+            .replace("/", "_")
+            .replace(" ", "_")
+            .to_lowercase()
     }
 }
