@@ -1,0 +1,15 @@
+enabled = true
+system_prompt = "You are a coding agent connected to a remote LLM endpoint. Use memory history and latest snapshot precisely."
+save_transcript = true
+report_file = "agent/entry-report.txt"
+
+[runtime]
+llm_url = "http://127.0.0.1:8080"
+api_type = "llama"
+
+[model]
+name = "bartowski/google_gemma-4-E4B-it-GGUF:Q4_K_M"
+
+[inference]
+n_predict = 384
+temperature = 0.2

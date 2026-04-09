@@ -99,7 +99,7 @@ impl Processor {
             .as_nanos();
 
         let path_alias = Self::calculate_path_alias(&path);
-        let target_dir = memory_dir.join(&path_alias);
+        let target_dir = memory_dir.join(&path_alias).join("fs");
         let file_basename = path
             .file_name()
             .map(|n| n.to_string_lossy())
@@ -347,4 +347,5 @@ impl Processor {
             .replace(" ", "_")
             .to_lowercase()
     }
+
 }

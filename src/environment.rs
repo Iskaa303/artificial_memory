@@ -10,12 +10,6 @@ use tokio::process::Command;
 use walkdir::WalkDir;
 use wasmtime::{Engine, Instance, Module, Store};
 
-#[cfg(windows)]
-use std::os::windows::fs::{symlink_dir, symlink_file};
-
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-
 const WASM_COMMAND_BRIDGE_WAT: &str = r#"
 (module
     (memory (export "memory") 2)
@@ -563,6 +557,13 @@ impl WasmEnvironmentManager {
     }
 
     async fn list_memory_entries(&self) -> Result<Vec<String>> {
+        if !self.memory_root.exists() {
+            tokio::fs::create_dir_all(&self.memory_root)
+                .await
+                .with_context(|| format!("failed to create {}", self.memory_root.display()))?;
+            return Ok(Vec::new());
+        }
+
         let mut folders = Vec::new();
         let mut dir = tokio::fs::read_dir(&self.memory_root)
             .await
@@ -1066,19 +1067,27 @@ impl WasmEnvironmentManager {
         let normalized_profile = self.normalize_profile_name(profile_name);
         let env_name = self.environment_name_for_folder(&normalized_folder, environment_label);
         let env_root = self.memory_environment_root(&normalized_folder, &env_name);
-
-        if env_root.exists() {
-            return self.read_manifest(&env_name).await;
-        }
+        let entry_root = self.memory_root.join(&normalized_folder);
 
         let profile_path = self.profile_path(&normalized_profile);
         if !profile_path.exists() {
             bail!("profile does not exist: {normalized_profile}");
         }
 
-        let entry_root = self.memory_root.join(&normalized_folder);
+        if env_root.exists() {
+            return self
+                .repair_existing_environment(
+                    &env_name,
+                    &entry_root,
+                    &env_root,
+                    profile_path.as_path(),
+                )
+                .await;
+        }
+
         let fs_root = self.create_environment_fs_root(&env_root).await?;
-        self.link_memory_entry_contents(&entry_root, &fs_root).await?;
+        self.migrate_memory_entry_contents_to_fs(&entry_root, &fs_root)
+            .await?;
 
         let config_path = env_root.join("Environment.toml");
         self.initialize_environment_toml(&config_path, Some(profile_path.as_path()))
@@ -1095,6 +1104,39 @@ impl WasmEnvironmentManager {
         self.write_manifest(&manifest.name, &manifest).await?;
         self.prepare_environment_runtime(&manifest.name).await?;
 
+        Ok(manifest)
+    }
+
+    async fn repair_existing_environment(
+        &self,
+        env_name: &str,
+        entry_root: &Path,
+        env_root: &Path,
+        profile_path: &Path,
+    ) -> Result<EnvironmentManifest> {
+        let fs_root = self.create_environment_fs_root(env_root).await?;
+        self.migrate_memory_entry_contents_to_fs(entry_root, &fs_root)
+            .await?;
+
+        let config_path = env_root.join("Environment.toml");
+        if !config_path.exists() {
+            self.initialize_environment_toml(&config_path, Some(profile_path))
+                .await?;
+        }
+
+        let manifest = match self.read_manifest(env_name).await {
+            Ok(existing) => existing,
+            Err(_) => EnvironmentManifest {
+                name: env_name.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                selected_sources: vec![entry_root.to_string_lossy().to_string()],
+                fs_root: fs_root.to_string_lossy().to_string(),
+                config_path: config_path.to_string_lossy().to_string(),
+            },
+        };
+
+        self.write_manifest(env_name, &manifest).await?;
+        self.prepare_environment_runtime(env_name).await?;
         Ok(manifest)
     }
 
@@ -1134,20 +1176,32 @@ impl WasmEnvironmentManager {
         Ok(())
     }
 
-    async fn link_memory_entry_contents(&self, entry_root: &Path, fs_root: &Path) -> Result<()> {
+    async fn migrate_memory_entry_contents_to_fs(
+        &self,
+        entry_root: &Path,
+        fs_root: &Path,
+    ) -> Result<()> {
         let mut dir = tokio::fs::read_dir(entry_root)
             .await
             .with_context(|| format!("failed to read {}", entry_root.display()))?;
 
         while let Some(entry) = dir.next_entry().await? {
             let file_name = entry.file_name();
-            if file_name.to_string_lossy() == "environment" {
+            let name = file_name.to_string_lossy();
+            if name == "environment"
+                || name == "fs"
+                || name == "rust"
+                || name == "repl"
+                || name == "manifest.json"
+                || name == "Environment.toml"
+                || name == "command-log.jsonl"
+            {
                 continue;
             }
 
             let source = entry.path();
             let destination = fs_root.join(&file_name);
-            self.create_symlink(&source, &destination).await?;
+            self.move_without_duplicates(&source, &destination).await?;
         }
 
         Ok(())
@@ -1159,8 +1213,36 @@ impl WasmEnvironmentManager {
         Ok(())
     }
 
-    async fn create_symlink(&self, source: &Path, destination: &Path) -> Result<()> {
-        if destination.exists() {
+    async fn move_without_duplicates(&self, source: &Path, destination: &Path) -> Result<()> {
+        let source_meta = tokio::fs::symlink_metadata(source)
+            .await
+            .with_context(|| format!("failed to inspect {}", source.display()))?;
+
+        if source_meta.file_type().is_symlink() {
+            tokio::fs::remove_file(source)
+                .await
+                .with_context(|| format!("failed to remove legacy symlink {}", source.display()))?;
+            return Ok(());
+        }
+
+        if source_meta.is_dir() {
+            tokio::fs::create_dir_all(destination)
+                .await
+                .with_context(|| format!("failed to create {}", destination.display()))?;
+
+            let mut dir = tokio::fs::read_dir(source)
+                .await
+                .with_context(|| format!("failed to read {}", source.display()))?;
+
+            while let Some(entry) = dir.next_entry().await? {
+                let src_child = entry.path();
+                let dst_child = destination.join(entry.file_name());
+                Box::pin(self.move_without_duplicates(&src_child, &dst_child)).await?;
+            }
+
+            tokio::fs::remove_dir(source)
+                .await
+                .with_context(|| format!("failed to remove {}", source.display()))?;
             return Ok(());
         }
 
@@ -1170,41 +1252,43 @@ impl WasmEnvironmentManager {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let metadata = tokio::fs::metadata(source)
-            .await
-            .with_context(|| format!("failed to inspect {}", source.display()))?;
-        let source = source.to_path_buf();
-        let destination = destination.to_path_buf();
+        if destination.exists() {
+            let dst_meta = tokio::fs::symlink_metadata(destination)
+                .await
+                .with_context(|| format!("failed to inspect {}", destination.display()))?;
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if metadata.is_dir() {
-                #[cfg(windows)]
-                {
-                    symlink_dir(&source, &destination)
-                        .with_context(|| format!("failed to link {}", source.display()))?;
-                }
-                #[cfg(unix)]
-                {
-                    symlink(&source, &destination)
-                        .with_context(|| format!("failed to link {}", source.display()))?;
-                }
-            } else {
-                #[cfg(windows)]
-                {
-                    symlink_file(&source, &destination)
-                        .with_context(|| format!("failed to link {}", source.display()))?;
-                }
-                #[cfg(unix)]
-                {
-                    symlink(&source, &destination)
-                        .with_context(|| format!("failed to link {}", source.display()))?;
-                }
+            if dst_meta.file_type().is_symlink() {
+                tokio::fs::remove_file(destination).await.with_context(|| {
+                    format!("failed to remove legacy symlink {}", destination.display())
+                })?;
+                tokio::fs::rename(source, destination)
+                    .await
+                    .with_context(|| format!("failed to move {}", source.display()))?;
+                return Ok(());
             }
 
-            Ok(())
-        })
-        .await
-        .context("symlink creation task failed")??;
+            let source_bytes = tokio::fs::read(source)
+                .await
+                .with_context(|| format!("failed to read {}", source.display()))?;
+            let destination_bytes = tokio::fs::read(destination)
+                .await
+                .with_context(|| format!("failed to read {}", destination.display()))?;
+
+            if source_bytes == destination_bytes {
+                tokio::fs::remove_file(source)
+                    .await
+                    .with_context(|| format!("failed to remove duplicate {}", source.display()))?;
+                return Ok(());
+            }
+
+            tokio::fs::remove_file(destination)
+                .await
+                .with_context(|| format!("failed to replace {}", destination.display()))?;
+        }
+
+        tokio::fs::rename(source, destination)
+            .await
+            .with_context(|| format!("failed to move {}", source.display()))?;
 
         Ok(())
     }
@@ -1229,11 +1313,8 @@ impl WasmEnvironmentManager {
     }
 
     fn environment_name_for_folder(&self, folder: &str, environment_label: &str) -> String {
-        format!(
-            "env-{}-{}",
-            self.slugify(folder),
-            self.slugify(environment_label)
-        )
+        let _ = environment_label;
+        folder.to_string()
     }
 
     fn repl_session_path(&self, environment_name: &str, session: &str) -> PathBuf {
@@ -1255,6 +1336,11 @@ impl WasmEnvironmentManager {
     }
 
     fn find_environment_root(&self, name: &str) -> Option<PathBuf> {
+        let direct = self.memory_root.join(name);
+        if direct.is_dir() {
+            return Some(direct);
+        }
+
         let entries = std::fs::read_dir(&self.memory_root).ok()?;
         for entry in entries.flatten() {
             let entry_path = entry.path();
@@ -1262,9 +1348,22 @@ impl WasmEnvironmentManager {
                 continue;
             }
 
+            // Legacy nested layout support.
             let local_env = entry_path.join("environment").join(name);
             if local_env.exists() {
                 return Some(local_env);
+            }
+
+            // Flattened layout support by matching manifest name.
+            let manifest = entry_path.join("manifest.json");
+            if manifest.is_file() {
+                if let Ok(raw) = std::fs::read_to_string(&manifest) {
+                    if let Ok(parsed) = serde_json::from_str::<EnvironmentManifest>(&raw) {
+                        if parsed.name == name {
+                            return Some(entry_path);
+                        }
+                    }
+                }
             }
         }
 
@@ -1272,10 +1371,8 @@ impl WasmEnvironmentManager {
     }
 
     fn memory_environment_root(&self, memory_folder: &str, environment_name: &str) -> PathBuf {
-        self.memory_root
-            .join(memory_folder)
-            .join("environment")
-            .join(environment_name)
+        let _ = environment_name;
+        self.memory_root.join(memory_folder)
     }
 
     fn shared_environment_root(&self, environment_name: &str) -> PathBuf {

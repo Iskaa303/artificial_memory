@@ -21,6 +21,8 @@ similar = "3.0.0"
 chrono = "0.4.44"
 indicatif = { version = "0.18.4", features = ["rayon"] }
 walkdir = "2.5.0"
-wasmtime = "43.0.0"
+wasmtime = "43.0.1"
 wat = "1.246.2"
 toml = "1.1.2"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
+zip = "8.5.1"
