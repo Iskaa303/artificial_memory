@@ -1,0 +1,37 @@
+[profile]
+name = "file-operations"
+description = "File-manipulation profile with filesystem helpers, globs, walking, and convenience snippets."
+tier = "extended"
+
+[rust]
+edition = "2021"
+prelude = [
+    "use eyre::{Result, WrapErr};",
+    "use fs_err as fs;",
+    "use glob::glob;",
+    "use std::path::PathBuf;",
+    "use walkdir::WalkDir;",
+    "fn read_text(path: impl AsRef<std::path::Path>) -> Result<String> { fs::read_to_string(path.as_ref()).wrap_err(\"failed to read text file\") }",
+    "fn write_text(path: impl AsRef<std::path::Path>, content: &str) -> Result<()> { fs::write(path.as_ref(), content).wrap_err(\"failed to write text file\")?; Ok(()) }",
+    "fn list_files(root: impl AsRef<std::path::Path>) -> Vec<PathBuf> { WalkDir::new(root).into_iter().filter_map(|entry| entry.ok()).filter(|entry| entry.file_type().is_file()).map(|entry| entry.path().to_path_buf()).collect() }",
+]
+
+[[rust.crates]]
+name = "eyre"
+version = "0.6"
+
+[[rust.crates]]
+name = "walkdir"
+version = "2.5"
+
+[[rust.crates]]
+name = "glob"
+version = "0.3"
+
+[[rust.crates]]
+name = "fs-err"
+version = "3.1"
+
+[[rust.crates]]
+name = "num-traits"
+version = "0.2"

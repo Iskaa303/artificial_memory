@@ -1,7 +1,20 @@
 use eyre::{Result, WrapErr};
+use log::LevelFilter;
 
 pub fn init() -> Result<()> {
-    env_logger::Builder::from_default_env()
+    let mut builder = env_logger::Builder::from_default_env();
+
+    // Keep dependency compiler/runtime internals quiet even when the app runs at debug.
+    for module in [
+        "cranelift",
+        "cranelift_codegen",
+        "wasmtime",
+        "wasmtime_internal_cranelift",
+    ] {
+        builder.filter_module(module, LevelFilter::Warn);
+    }
+
+    builder
         .format(|buf, record| {
             use std::io::Write;
 

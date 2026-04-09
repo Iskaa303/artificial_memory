@@ -1,6 +1,7 @@
 mod process;
 mod logger;
 mod storage;
+mod environment;
 
 use eyre::Result;
 use log::{error, info, warn};
@@ -29,6 +30,12 @@ async fn main() -> Result<()> {
     }
 
     info!("Collected {} unique files", storage.len());
+
+    let workspace_root = std::env::current_dir()?;
+    let env_manager = environment::WasmEnvironmentManager::new("memory", workspace_root)?;
+    if let Err(e) = env_manager.create_environments_for_memory_entries().await {
+        warn!("Failed to prepare per-memory-entry isolated environments: {:?}", e);
+    }
 
     if let Err(e) = Processor::process_all(storage.paths()).await {
         error!("Fatal error during processing: {:?}", e);

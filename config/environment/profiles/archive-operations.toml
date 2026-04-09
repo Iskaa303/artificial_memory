@@ -1,0 +1,27 @@
+[profile]
+name = "archive-operations"
+description = "Archive and compression profile for unzipping and inspecting packaged files."
+tier = "extended"
+
+[rust]
+edition = "2021"
+prelude = [
+    "use eyre::{Result, WrapErr};",
+    "use std::fs::File;",
+    "use std::io::{copy, Read};",
+    "use std::path::Path;",
+    "use zip::ZipArchive;",
+    "fn open_zip(path: impl AsRef<Path>) -> Result<ZipArchive<File>> { let file = File::open(path.as_ref()).wrap_err(\"failed to open zip file\")?; ZipArchive::new(file).wrap_err(\"failed to parse zip archive\") }",
+]
+
+[[rust.crates]]
+name = "eyre"
+version = "0.6"
+
+[[rust.crates]]
+name = "zip"
+version = "2.2"
+
+[[rust.crates]]
+name = "flate2"
+version = "1.0"

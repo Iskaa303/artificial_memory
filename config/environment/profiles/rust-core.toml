@@ -1,0 +1,28 @@
+[profile]
+name = "rust-core"
+description = "Core Rust profile for REPL usage, serialization, and small calculations."
+tier = "standard"
+
+[rust]
+edition = "2021"
+prelude = [
+	"use eyre::{Result, WrapErr};",
+	"use serde::{Deserialize, Serialize};",
+	"use num_traits::{Float, ToPrimitive};",
+]
+
+[[rust.crates]]
+name = "eyre"
+version = "0.6"
+
+[[rust.crates]]
+name = "serde"
+version = "1.0"
+
+[[rust.crates]]
+name = "serde_json"
+version = "1.0"
+
+[[rust.crates]]
+name = "num-traits"
+version = "0.2"

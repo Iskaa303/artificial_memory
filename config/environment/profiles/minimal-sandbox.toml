@@ -1,0 +1,15 @@
+[profile]
+name = "minimal-sandbox"
+description = "Minimal isolated Rust profile with ergonomic error handling."
+tier = "strict"
+
+[rust]
+edition = "2021"
+prelude = [
+	"use eyre::{Result, WrapErr};",
+	"use std::path::{Path, PathBuf};",
+]
+
+[[rust.crates]]
+name = "eyre"
+version = "0.6"

@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2024"
 authors = ["Iskander 'Iskaa303' Madikhan"]
 license = "MIT"
+readme = "README.md"
 
 [dependencies]
 log = "0.4.29"
@@ -19,3 +20,7 @@ tokio = { version = "1.51.1", features = ["full"] }
 similar = "3.0.0"
 chrono = "0.4.44"
 indicatif = { version = "0.18.4", features = ["rayon"] }
+walkdir = "2.5.0"
+wasmtime = "43.0.0"
+wat = "1.246.2"
+toml = "1.1.2"
