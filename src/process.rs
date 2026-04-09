@@ -280,6 +280,8 @@ impl Processor {
         let path_buf = path.to_path_buf();
         let pb_inner = pb.clone();
         let hash = tokio::task::spawn_blocking(move || -> Result<String> {
+            use std::fmt::Write as _;
+
             let mut f =
                 fs::File::open(&path_buf).map_err(|_| ProcessError::File(path_buf.clone()))?;
 
@@ -307,7 +309,13 @@ impl Processor {
                 pb_inner.inc(n as u64);
             }
 
-            Ok(format!("{:x}", hasher.finalize()))
+            let digest = hasher.finalize();
+            let mut hex = String::with_capacity(digest.len() * 2);
+            for byte in digest.as_slice() {
+                let _ = write!(&mut hex, "{:02x}", byte);
+            }
+
+            Ok(hex)
         })
         .await
         .wrap_err("Hashing task panicked")??;
